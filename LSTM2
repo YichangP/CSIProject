@@ -1,0 +1,130 @@
+import os
+import numpy as np
+from multiprocessing import Pool
+from sklearn.preprocessing import MinMaxScaler
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+
+def read_file(file_path):
+    try:
+        data = np.load(file_path)
+        print(f"File loaded successfully: {file_path}")
+        return data
+    except (IOError, ValueError) as e:
+        print(f"Error loading file: {file_path}")
+        print(f"Error details: {str(e)}")
+        return None
+
+
+def process_folder(args):
+    num_people, folder_path = args
+    train_data = []
+    train_labels = []
+    test_data = []
+    test_labels = []
+
+    files = os.listdir(folder_path)
+    for file_name in files:
+        file_path = os.path.join(folder_path, file_name)
+
+        if not os.path.isfile(file_path):
+            print(f"File not found: {file_path}. Skipping.")
+            continue
+
+        data = read_file(file_path)
+        if data is not None:
+            # 根据文件名中的最后一个数字划分训练集和测试集
+            if int(file_name.split("_")[-1].split(".")[0]) <= 8:
+                train_data.append(data)
+                train_labels.append(num_people)
+            else:
+                test_data.append(data)
+                test_labels.append(num_people)
+
+    return train_data, train_labels, test_data, test_labels
+
+
+if __name__ == '__main__':
+    # 设置切分后数据的文件夹路径
+    dataset_path = '/Users/demons/Documents/EIE/Dissertation/dataset'
+
+    # 指定要训练的人数范围
+    num_people_range = range(21)  # 0到20
+
+    # 使用多进程读取数据
+    pool = Pool()
+    results = []
+
+    for num_people in num_people_range:
+        folder_path = os.path.join(dataset_path, str(num_people))
+
+        if not os.path.exists(folder_path):
+            print(f"Folder not found for {num_people} people. Skipping.")
+            continue
+
+        results.append(pool.apply_async(process_folder, [(num_people, folder_path)]))
+
+    pool.close()
+    pool.join()
+
+    train_data = []
+    train_labels = []
+    test_data = []
+    test_labels = []
+
+    for result in results:
+        train_data_part, train_labels_part, test_data_part, test_labels_part = result.get()
+        train_data.extend(train_data_part)
+        train_labels.extend(train_labels_part)
+        test_data.extend(test_data_part)
+        test_labels.extend(test_labels_part)
+
+
+    # 对数据进行异常值处理
+    def remove_outliers(data):
+        Q1 = np.percentile(data, 25, axis=0)
+        Q3 = np.percentile(data, 75, axis=0)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        return np.clip(data, lower_bound, upper_bound)
+
+
+    train_data = [remove_outliers(data) for data in train_data]
+    test_data = [remove_outliers(data) for data in test_data]
+
+    # 对数据进行归一化处理
+    scaler = MinMaxScaler()
+
+    for i in range(len(train_data)):
+        train_data[i] = scaler.fit_transform(train_data[i])
+
+    for i in range(len(test_data)):
+        test_data[i] = scaler.transform(test_data[i])
+
+    # 将数据转换为NumPy数组
+    train_data = np.array(train_data)
+    test_data = np.array(test_data)
+
+    # 将标签转换为NumPy数组
+    train_labels = np.array(train_labels, dtype='int32')
+    test_labels = np.array(test_labels, dtype='int32')
+
+    # 创建并训练LSTM模型
+    with tf.device('/gpu:0'):  # 在GPU上创建模型
+        model = Sequential([
+            LSTM(64, input_shape=(train_data.shape[1], train_data.shape[2])),
+            Dense(32, activation='relu'),
+            Dense(len(num_people_range), activation='softmax')
+        ])
+
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.fit(train_data, train_labels, epochs=10, batch_size=32, validation_data=(test_data, test_labels))
+
+    # 在测试集上评估模型
+    loss, accuracy = model.evaluate(test_data, test_labels)
+    print(f"Test loss: {loss:.4f}")
+    print(f"Test accuracy: {accuracy:.4f}")
